@@ -306,8 +306,44 @@ impl LsmStorageInner {
 
     /// Put a key-value pair into the storage by writing into the current memtable.
     pub fn put(&self, _key: &[u8], _value: &[u8]) -> Result<()> {
-        let read_lock = self.state.read();
-        read_lock.memtable.put(_key, _value)?;
+        // 1. 获取 state_lock 以协调冻结操作，防止多个线程同时冻结
+        let state_lock_guard = self.state_lock.lock();
+
+        // 2. 获取 state 的读锁，以读取当前的 memtable 引用
+        //    注意：这里持有读锁的时间应该尽可能短
+        let memtable_to_write = {
+            let read_guard = self.state.read();
+            Arc::clone(&read_guard.memtable) // 克隆 Arc，增加引用计数
+        };
+        // ---- 读锁在这里释放 ----
+
+        // 3. 将数据写入获取到的 MemTable 引用
+        //    即使 state 读锁已释放，这个 Arc 引用仍然有效
+        //    MemTable::put 使用内部可变性，所以只需要 &self
+        memtable_to_write.put(_key, _value)?;
+
+        // 4. 获取写入后的近似大小
+        let estimated_size = memtable_to_write.approximate_size();
+
+        // 5. 检查是否需要冻结
+        let mut should_freeze = false;
+        if estimated_size >= self.options.target_sst_size {
+            // 再次检查，确保我们操作的是仍然是活跃的 memtable
+            // （虽然在 state_lock 保护下，理论上不会被其他线程改变，但这是个好习惯）
+            let current_active_memtable_id = self.state.read().memtable.id();
+            if memtable_to_write.id() == current_active_memtable_id {
+                should_freeze = true;
+            }
+        }
+
+        // 6. 如果需要冻结，则调用冻结函数
+        if should_freeze {
+            // force_freeze_memtable 会获取 state 的写锁来更新状态
+            // 我们仍然持有 state_lock_guard 来确保只有一个线程执行冻结
+            self.force_freeze_memtable(&state_lock_guard)?;
+        }
+
+        // ---- state_lock_guard 在函数结束时自动释放 ----
         Ok(())
     }
 
@@ -339,7 +375,23 @@ impl LsmStorageInner {
 
     /// Force freeze the current memtable to an immutable memtable
     pub fn force_freeze_memtable(&self, _state_lock_observer: &MutexGuard<'_, ()>) -> Result<()> {
-        unimplemented!()
+        let new_memtable = Arc::new(MemTable::create(self.next_sst_id()));
+        let mut state_guard = self.state.write();
+
+        // Create a mutable copy of the current state
+        let mut new_state = (**state_guard).clone();
+
+        // Move the current memtable to the immutable list (insert at front based on comment)
+        new_state
+            .imm_memtables
+            .insert(0, Arc::clone(&new_state.memtable));
+        // Update the active memtable
+        new_state.memtable = new_memtable;
+
+        // Update the state held by the RwLock
+        *state_guard = Arc::new(new_state);
+
+        Ok(())
     }
 
     /// Force flush the earliest-created immutable memtable to disk

@@ -96,6 +96,7 @@ fn test_task3_storage_integration() {
         .unwrap();
     assert_eq!(storage.state.read().imm_memtables.len(), 1);
     let previous_approximate_size = storage.state.read().imm_memtables[0].approximate_size();
+    assert_eq!(previous_approximate_size, 15);
     assert!(previous_approximate_size >= 15);
     storage.put(b"1", b"2333").unwrap();
     storage.put(b"2", b"23333").unwrap();

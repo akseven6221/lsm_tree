@@ -98,6 +98,11 @@ impl MemTable {
         })
     }
 
+    ///
+    pub fn contains(&self, key: &[u8]) -> bool {
+        self.map.contains_key(key)
+    }
+
     /// Put a key-value pair into the mem-table.
     ///
     /// In week 1, day 1, simply put the key-value pair into the skipmap.
@@ -106,6 +111,9 @@ impl MemTable {
     pub fn put(&self, _key: &[u8], _value: &[u8]) -> Result<()> {
         self.map
             .insert(Bytes::copy_from_slice(_key), Bytes::copy_from_slice(_value));
+        let size_to_add = _key.len() + _value.len();
+        self.approximate_size
+            .fetch_add(size_to_add, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
