@@ -89,13 +89,7 @@ impl MemTable {
 
     /// Get a value by key.
     pub fn get(&self, _key: &[u8]) -> Option<Bytes> {
-        self.map.get(_key).and_then(|v| {
-            if v.value().is_empty() {
-                None
-            } else {
-                Some(v.value().clone())
-            }
-        })
+        self.map.get(_key).map(|v| v.value().clone())
     }
 
     ///
