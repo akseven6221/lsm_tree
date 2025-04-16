@@ -59,7 +59,22 @@ pub struct MergeIterator<I: StorageIterator> {
 
 impl<I: StorageIterator> MergeIterator<I> {
     pub fn create(iters: Vec<Box<I>>) -> Self {
-        unimplemented!()
+        let mut heap = BinaryHeap::new();
+        // 使用 enumerate 来同时获取索引和迭代器
+        for (idx, iter) in iters.into_iter().enumerate() {
+            if iter.is_valid() {
+                // 将有效的迭代器包装后放入堆中
+                heap.push(HeapWrapper(idx, iter));
+            }
+        }
+
+        // 从堆顶弹出第一个元素（key 最小，如果 key 相同则 index 最小）作为初始 current
+        let current = heap.pop();
+
+        MergeIterator {
+            iters: heap,
+            current,
+        }
     }
 }
 
@@ -69,18 +84,69 @@ impl<I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>> StorageIt
     type KeyType<'a> = KeySlice<'a>;
 
     fn key(&self) -> KeySlice {
-        unimplemented!()
+        self.current
+            .as_ref()
+            .map(|x| x.1.key())
+            .unwrap_or_else(|| KeySlice::from_slice(&[]))
     }
 
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        self.current
+            .as_ref()
+            .map(|x| x.1.value())
+            .unwrap_or_else(|| &[])
     }
 
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        self.current
+            .as_ref()
+            .map(|x| x.1.is_valid())
+            .unwrap_or(false)
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        // 1. 取出当前的 HeapWrapper，将 self.current 置为 None
+        let mut current_wrapper = match self.current.take() {
+            Some(wrapper) => wrapper,
+            None => return Ok(()), // 如果已经结束，直接返回
+        };
+
+        // 2. 保存当前暴露的 key，用于后续跳过相同 key
+        let current_key = current_wrapper.1.key().to_key_vec(); // 需要复制一份 key
+
+        // 3. 将刚处理完的迭代器向前移动一步
+        current_wrapper.1.next()?;
+
+        // 4. 如果移动后仍然有效，将其重新加入堆中
+        if current_wrapper.1.is_valid() {
+            self.iters.push(current_wrapper);
+        }
+
+        // 5. 循环处理堆顶元素，直到找到一个与 current_key 不同的 key，或者堆为空
+        while let Some(top_wrapper) = self.iters.peek() {
+            // 检查堆顶元素的 key 是否与我们刚刚处理的 key 相同
+            if top_wrapper.1.key() == current_key.as_key_slice() {
+                // 如果 key 相同，说明这个元素是旧版本，需要跳过
+                // 从堆中弹出这个元素
+                let mut skipped_wrapper = self.iters.pop().unwrap(); // unwrap 安全，因为 peek() 刚检查过
+
+                // 将这个被跳过的迭代器也向前移动一步
+                skipped_wrapper.1.next()?;
+
+                // 如果移动后仍然有效，重新加入堆中
+                if skipped_wrapper.1.is_valid() {
+                    self.iters.push(skipped_wrapper);
+                }
+                // 继续循环，检查新的堆顶元素
+            } else {
+                // 如果堆顶元素的 key 不同，说明找到了下一个应该暴露的 key，跳出循环
+                break;
+            }
+        }
+
+        // 6. 循环结束后，堆顶的元素（如果有的话）就是下一个 current
+        self.current = self.iters.pop();
+
+        Ok(())
     }
 }
