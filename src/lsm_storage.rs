@@ -30,9 +30,11 @@ use crate::compact::{
     CompactionController, CompactionOptions, LeveledCompactionController, LeveledCompactionOptions,
     SimpleLeveledCompactionController, SimpleLeveledCompactionOptions, TieredCompactionController,
 };
+use crate::iterators::StorageIterator;
+use crate::iterators::merge_iterator::MergeIterator;
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::Manifest;
-use crate::mem_table::{self, MemTable};
+use crate::mem_table::{self, MemTable, map_bound};
 use crate::mvcc::LsmMvccInner;
 use crate::table::SsTable;
 
@@ -323,44 +325,15 @@ impl LsmStorageInner {
 
     /// Put a key-value pair into the storage by writing into the current memtable.
     pub fn put(&self, _key: &[u8], _value: &[u8]) -> Result<()> {
-        // 1. 获取 state_lock 以协调冻结操作，防止多个线程同时冻结
-        let state_lock_guard = self.state_lock.lock();
-
-        // 2. 获取 state 的读锁，以读取当前的 memtable 引用
-        //    注意：这里持有读锁的时间应该尽可能短
-        let memtable_to_write = {
-            let read_guard = self.state.read();
-            Arc::clone(&read_guard.memtable) // 克隆 Arc，增加引用计数
-        };
-        // ---- 读锁在这里释放 ----
-
-        // 3. 将数据写入获取到的 MemTable 引用
-        //    即使 state 读锁已释放，这个 Arc 引用仍然有效
-        //    MemTable::put 使用内部可变性，所以只需要 &self
-        memtable_to_write.put(_key, _value)?;
-
-        // 4. 获取写入后的近似大小
-        let estimated_size = memtable_to_write.approximate_size();
-
-        // 5. 检查是否需要冻结
-        let mut should_freeze = false;
-        if estimated_size >= self.options.target_sst_size {
-            // 再次检查，确保我们操作的是仍然是活跃的 memtable
-            // （虽然在 state_lock 保护下，理论上不会被其他线程改变，但这是个好习惯）
-            let current_active_memtable_id = self.state.read().memtable.id();
-            if memtable_to_write.id() == current_active_memtable_id {
-                should_freeze = true;
+        self.state.read().memtable.put(_key, _value)?;
+        if self.state.read().memtable.approximate_size() >= self.options.target_sst_size {
+            let state_lock = self.state_lock.lock();
+            let guard = self.state.read();
+            if self.state.read().memtable.approximate_size() >= self.options.target_sst_size {
+                drop(guard);
+                self.force_freeze_memtable(&state_lock)?;
             }
         }
-
-        // 6. 如果需要冻结，则调用冻结函数
-        if should_freeze {
-            // force_freeze_memtable 会获取 state 的写锁来更新状态
-            // 我们仍然持有 state_lock_guard 来确保只有一个线程执行冻结
-            self.force_freeze_memtable(&state_lock_guard)?;
-        }
-
-        // ---- state_lock_guard 在函数结束时自动释放 ----
         Ok(())
     }
 
@@ -427,6 +400,17 @@ impl LsmStorageInner {
         _lower: Bound<&[u8]>,
         _upper: Bound<&[u8]>,
     ) -> Result<FusedIterator<LsmIterator>> {
-        unimplemented!()
+        let snapshot = {
+            let guard = self.state.read();
+            Arc::clone(&guard)
+        };
+        let mut memtable_iters = Vec::with_capacity(snapshot.imm_memtables.len() + 1);
+        memtable_iters.push(Box::new(snapshot.memtable.scan(_lower, _upper)));
+        for memtable in snapshot.imm_memtables.iter() {
+            memtable_iters.push(Box::new(memtable.scan(_lower, _upper)));
+        }
+        Ok(FusedIterator::new(LsmIterator::new(
+            MergeIterator::create(memtable_iters),
+        )?))
     }
 }

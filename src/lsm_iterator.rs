@@ -15,7 +15,7 @@
 #![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
-use anyhow::Result;
+use anyhow::{Error, Result};
 
 use crate::{
     iterators::{StorageIterator, merge_iterator::MergeIterator},
@@ -31,7 +31,11 @@ pub struct LsmIterator {
 
 impl LsmIterator {
     pub(crate) fn new(iter: LsmIteratorInner) -> Result<Self> {
-        Ok(Self { inner: iter })
+        let mut lsm = Self { inner: iter };
+        if lsm.is_valid() && lsm.value().is_empty() {
+            lsm.next();
+        }
+        Ok(lsm)
     }
 }
 
@@ -39,19 +43,23 @@ impl StorageIterator for LsmIterator {
     type KeyType<'a> = &'a [u8];
 
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        self.inner.is_valid()
     }
 
     fn key(&self) -> &[u8] {
-        unimplemented!()
+        self.inner.key().raw_ref()
     }
 
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        self.inner.value()
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        self.inner.next();
+        if self.inner.is_valid() && self.inner.value().is_empty() {
+            return self.next();
+        }
+        Ok(())
     }
 }
 
@@ -79,18 +87,42 @@ impl<I: StorageIterator> StorageIterator for FusedIterator<I> {
         Self: 'a;
 
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        !self.has_errored && self.iter.is_valid()
     }
 
     fn key(&self) -> Self::KeyType<'_> {
-        unimplemented!()
+        self.iter.key()
     }
 
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        self.iter.value()
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        // 如果已经发生错误，则总是返回一个错误
+        if self.has_errored {
+            // 返回一个表示迭代器已出错的通用错误
+            // 或者，如果需要返回原始错误，需要修改 FusedIterator 结构来存储它
+            return Err(anyhow::anyhow!("Iterator has errored"));
+        }
+
+        // 如果内部迭代器当前无效，则 next 不做任何事，返回 Ok(())
+        if !self.iter.is_valid() {
+            return Ok(());
+        }
+
+        // 内部迭代器有效且未发生错误，尝试调用 next
+        match self.iter.next() {
+            Ok(()) => {
+                // 成功
+                Ok(())
+            }
+            Err(e) => {
+                // 发生错误，标记 has_errored = true
+                self.has_errored = true;
+                // 返回原始错误
+                Err(e)
+            }
+        }
     }
 }
